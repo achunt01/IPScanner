@@ -20,6 +20,7 @@ class IPScannerApp:
         self.cancel_event = threading.Event()
         self.results = []
         self.errors = []
+        self.host_rows = {}
         self.busy = False
         self.closing = False
 
@@ -94,13 +95,16 @@ class IPScannerApp:
 
         results_frame = ttk.Frame(container)
         results_frame.pack(fill=tk.BOTH, expand=True)
-        columns = ("ip", "hostname", "protocol", "port", "service", "product", "version")
+        columns = (
+            "ip", "hostname", "protocol", "port", "service", "product",
+            "version", "status",
+        )
         self.table = ttk.Treeview(
             results_frame, columns=columns, show="headings", selectmode="browse",
         )
         widths = {
-            "ip": 120, "hostname": 150, "protocol": 75, "port": 70,
-            "service": 130, "product": 190, "version": 130,
+            "ip": 110, "hostname": 125, "protocol": 70, "port": 60,
+            "service": 110, "product": 160, "version": 110, "status": 135,
         }
         for column in columns:
             self.table.heading(column, text=column.capitalize())
@@ -145,6 +149,7 @@ class IPScannerApp:
 
         self.results.clear()
         self.errors.clear()
+        self.host_rows.clear()
         self.table.delete(*self.table.get_children())
         self.progress.configure(maximum=1, value=0)
         self.cancel_event.clear()
@@ -185,15 +190,18 @@ class IPScannerApp:
                 for future in as_completed(futures):
                     if future.cancelled():
                         completed += 1
+                        self.events.put(("host_skipped", futures[future]))
                         self.events.put(("progress", completed))
                         continue
                     host = futures[future]
                     try:
                         results = future.result()
                         if results is not None:
-                            self.events.put(("results", results))
+                            self.events.put(("host_results", (host, results)))
+                        else:
+                            self.events.put(("host_skipped", host))
                     except Exception as exc:
-                        self.events.put(("error", f"{host}: {exc}"))
+                        self.events.put(("host_error", (host, str(exc))))
                     completed += 1
                     self.events.put(("progress", completed))
                     if self.cancel_event.is_set():
@@ -214,15 +222,48 @@ class IPScannerApp:
                     count = len(payload)
                     self.progress.configure(maximum=max(count, 1), value=0)
                     self.status.set(f"Found {count} live host(s)")
-                elif event == "results":
-                    for result in payload:
+                    for host in payload:
+                        self.host_rows[host] = self.table.insert(
+                            "", tk.END,
+                            values=(host, "", "", "", "", "", "", "Scanning ports…"),
+                        )
+                    if payload:
+                        self.table.see(self.host_rows[payload[0]])
+                elif event == "host_results":
+                    host, results = payload
+                    row = self.host_rows.pop(host, None)
+                    if row:
+                        self.table.delete(row)
+                    for result in results:
                         self.results.append(result)
                         self.table.insert(
                             "", tk.END,
                             values=tuple(result.get(key, "") for key in (
                                 "ip", "hostname", "protocol", "port",
                                 "service", "product", "version",
-                            )),
+                            )) + ("Open",),
+                        )
+                    if not results:
+                        self.table.insert(
+                            "", tk.END,
+                            values=(host, "", "", "", "", "", "", "No open ports"),
+                        )
+                    self.table.see(self.table.get_children()[-1])
+                elif event == "host_error":
+                    host, error = payload
+                    self.errors.append(f"{host}: {error}")
+                    row = self.host_rows.pop(host, None)
+                    if row:
+                        self.table.item(
+                            row, values=(host, "", "", "", "", "", "", "Scan failed"),
+                        )
+                    self.status.set(f"{len(self.errors)} host scan error(s)")
+                elif event == "host_skipped":
+                    host = payload
+                    row = self.host_rows.pop(host, None)
+                    if row:
+                        self.table.item(
+                            row, values=(host, "", "", "", "", "", "", "Cancelled"),
                         )
                 elif event == "progress":
                     self.progress.configure(value=payload)
@@ -230,9 +271,6 @@ class IPScannerApp:
                     self.status.set(
                         f"Processed {payload}/{total} host(s)"
                     )
-                elif event == "error":
-                    self.errors.append(payload)
-                    self.status.set(f"{len(self.errors)} host scan error(s)")
                 elif event == "fatal":
                     messagebox.showerror("Scan failed", payload, parent=self.root)
                 elif event == "finished":

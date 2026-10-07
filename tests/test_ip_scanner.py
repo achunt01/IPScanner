@@ -1,4 +1,5 @@
 import csv
+import io
 import queue
 import shlex
 import tempfile
@@ -10,10 +11,16 @@ from unittest.mock import MagicMock, patch
 from app import IPScannerApp
 from ip_scanner import (
     CSV_FIELDS,
+    HOST_FIELDS,
+    SCAN_PROFILES,
     build_scan_arguments,
+    build_nmap_command,
     build_target,
     discover_hosts,
+    export_hosts,
     export_results,
+    parse_nmap_host,
+    run_nmap_scan,
     scan_host,
 )
 
@@ -84,6 +91,153 @@ class BuildScanArgumentsTests(unittest.TestCase):
         self.assertIn("--script-args=-user=scan", shlex.split(arguments))
 
 
+class NmapCommandTests(unittest.TestCase):
+    def test_builds_safe_command_with_target_last(self):
+        command = build_nmap_command(
+            "192.168.1.0/24", "-sV --open", assume_up=True, executable="/usr/bin/nmap",
+        )
+        self.assertEqual(command, [
+            "/usr/bin/nmap", "-sV", "--open", "-Pn", "--stats-every", "1s",
+            "-oX", "-", "192.168.1.0/24",
+        ])
+
+    def test_scan_profiles_offer_distinct_tradeoffs(self):
+        self.assertEqual(set(SCAN_PROFILES), {"Quick", "Standard", "Thorough"})
+        self.assertNotEqual(
+            SCAN_PROFILES["Quick"]["ports"],
+            SCAN_PROFILES["Thorough"]["ports"],
+        )
+
+
+class NmapXmlTests(unittest.TestCase):
+    def test_parses_host_inventory_and_port_services(self):
+        xml = """<host>
+          <status state="up" reason="arp-response"/>
+          <address addr="192.168.1.5" addrtype="ipv4"/>
+          <hostnames><hostname name="router.local" type="PTR"/></hostnames>
+          <os><osmatch name="Example OS" accuracy="98"/></os>
+          <ports>
+            <port protocol="tcp" portid="443">
+              <state state="open" reason="syn-ack"/>
+              <service name="https" product="nginx" version="1.24"/>
+            </port>
+            <port protocol="tcp" portid="22">
+              <state state="closed" reason="reset"/>
+              <service name="ssh"/>
+            </port>
+          </ports>
+        </host>"""
+        import xml.etree.ElementTree as ET
+
+        inventory, ports = parse_nmap_host(ET.fromstring(xml))
+        self.assertEqual(inventory, {
+            "ip": "192.168.1.5",
+            "hostname": "router.local",
+            "status": "up",
+            "reason": "arp-response",
+            "open_ports": 1,
+            "protocols": "tcp",
+            "os": "Example OS",
+            "os_accuracy": "98",
+        })
+        self.assertEqual(ports[0]["service"], "https")
+        self.assertEqual(ports[0]["product"], "nginx")
+        self.assertEqual(ports[1]["state"], "closed")
+
+    def test_scan_process_streams_host_xml_and_progress(self):
+        xml = b"""<?xml version="1.0"?>
+        <nmaprun><hosthint><status state="up" reason="arp-response"/>
+        <address addr="192.168.1.9" addrtype="ipv4"/></hosthint>
+        <host><status state="up" reason="arp-response"/>
+        <address addr="192.168.1.9" addrtype="ipv4"/>
+        <ports><port protocol="tcp" portid="80"><state state="open"/>
+        <service name="http"/></port></ports></host></nmaprun>"""
+        process = type("FakeProcess", (), {
+            "stdout": io.BytesIO(xml),
+            "stderr": io.BytesIO(b"About 65.0% done; ETC: 00:01\n"),
+            "poll": lambda _self: 0,
+            "wait": lambda _self, timeout=None: 0,
+            "terminate": lambda _self: None,
+            "kill": lambda _self: None,
+        })()
+        hosts = []
+        hints = []
+        progress = []
+        with patch("ip_scanner.subprocess.Popen", return_value=process) as popen:
+            outcome = run_nmap_scan(
+                "192.168.1.0/24",
+                "-sV --open",
+                executable="/usr/bin/nmap",
+                on_host=lambda inventory, ports: hosts.append((inventory, ports)),
+                on_host_hint=hints.append,
+                on_progress=lambda percent, text: progress.append((percent, text)),
+            )
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-3:], ["-oX", "-", "192.168.1.0/24"])
+        self.assertEqual(outcome, "complete")
+        self.assertEqual(len(hosts), 1)
+        self.assertEqual(hints[0]["ip"], "192.168.1.9")
+        self.assertEqual(hosts[0][0]["ip"], "192.168.1.9")
+        self.assertEqual(hosts[0][0]["open_ports"], 1)
+        self.assertEqual(hosts[0][1][0]["port"], 80)
+        self.assertTrue(any(item[0] == 65 for item in progress))
+
+    def test_host_hint_without_host_element_is_exported_as_zero_open_ports(self):
+        xml = b"""<?xml version="1.0"?>
+        <nmaprun><hosthint><status state="up" reason="arp-response"/>
+        <address addr="192.168.1.9" addrtype="ipv4"/></hosthint></nmaprun>"""
+        process = type("FakeProcess", (), {
+            "stdout": io.BytesIO(xml),
+            "stderr": io.BytesIO(),
+            "poll": lambda _self: 0,
+            "wait": lambda _self, timeout=None: 0,
+            "terminate": lambda _self: None,
+            "kill": lambda _self: None,
+        })()
+        hosts = []
+        with patch("ip_scanner.subprocess.Popen", return_value=process):
+            outcome = run_nmap_scan(
+                "192.168.1.0/24", "--open", executable="/usr/bin/nmap",
+                on_host=lambda inventory, ports: hosts.append((inventory, ports)),
+            )
+
+        self.assertEqual(outcome, "complete")
+        self.assertEqual(len(hosts), 1)
+        self.assertEqual(hosts[0][0]["open_ports"], 0)
+        self.assertEqual(hosts[0][1], [])
+
+    def test_scan_with_no_reported_hosts_returns_empty(self):
+        process = type("FakeProcess", (), {
+            "stdout": io.BytesIO(b"<?xml version='1.0'?><nmaprun></nmaprun>"),
+            "stderr": io.BytesIO(),
+            "poll": lambda _self: 0,
+            "wait": lambda _self, timeout=None: 0,
+            "terminate": lambda _self: None,
+            "kill": lambda _self: None,
+        })()
+        with patch("ip_scanner.subprocess.Popen", return_value=process):
+            outcome = run_nmap_scan(
+                "192.168.1.0/24", "--open", executable="/usr/bin/nmap",
+            )
+        self.assertEqual(outcome, "empty")
+
+    def test_nonzero_exit_reports_nmap_stderr(self):
+        process = type("FakeProcess", (), {
+            "stdout": io.BytesIO(b"<?xml version='1.0'?><nmaprun></nmaprun>"),
+            "stderr": io.BytesIO(b"permission denied\n"),
+            "poll": lambda _self: 1,
+            "wait": lambda _self, timeout=None: 1,
+            "terminate": lambda _self: None,
+            "kill": lambda _self: None,
+        })()
+        with patch("ip_scanner.subprocess.Popen", return_value=process):
+            with self.assertRaisesRegex(RuntimeError, "permission denied"):
+                run_nmap_scan(
+                    "192.168.1.0/24", "--open", executable="/usr/bin/nmap",
+                )
+
+
 class ExportResultsTests(unittest.TestCase):
     def test_writes_header_and_rows(self):
         record = {
@@ -95,6 +249,7 @@ class ExportResultsTests(unittest.TestCase):
             "service": "https",
             "product": "nginx",
             "version": "1.24",
+            "os": "",
         }
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "results.csv"
@@ -107,6 +262,26 @@ class ExportResultsTests(unittest.TestCase):
         self.assertEqual(rows[0]["ip"], record["ip"])
         self.assertEqual(rows[0]["port"], "443")
         self.assertEqual(rows[0]["state"], "open")
+
+    def test_exports_host_inventory_including_no_open_ports(self):
+        hosts = [{
+            "ip": "192.168.1.8",
+            "hostname": "",
+            "status": "up",
+            "reason": "arp-response",
+            "open_ports": 0,
+            "protocols": "",
+            "os": "",
+            "os_accuracy": "",
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hosts.csv"
+            export_hosts(path, hosts)
+            with path.open(newline="", encoding="utf-8") as file:
+                rows = list(csv.DictReader(file))
+        self.assertEqual(tuple(rows[0]), HOST_FIELDS)
+        self.assertEqual(rows[0]["ip"], "192.168.1.8")
+        self.assertEqual(rows[0]["open_ports"], "0")
 
 
 class ScanOperationTests(unittest.TestCase):
@@ -173,34 +348,35 @@ class ScanOperationTests(unittest.TestCase):
 
 
 class ProgressiveScanTests(unittest.TestCase):
-    def test_worker_publishes_discovery_and_each_host_result(self):
+    def test_scan_worker_publishes_hosts_and_progress_as_they_arrive(self):
         app = IPScannerApp.__new__(IPScannerApp)
         app.events = queue.Queue()
         app.cancel_event = threading.Event()
-        host_results = {
-            "192.168.1.2": [],
-            "192.168.1.3": [{"ip": "192.168.1.3", "port": 443}],
+        host = {
+            "ip": "192.168.1.2", "hostname": "", "status": "up",
+            "reason": "arp-response", "open_ports": 0, "protocols": "",
+            "os": "", "os_accuracy": "",
         }
 
-        with patch("app.discover_hosts", return_value=list(host_results)) as discover:
-            with patch(
-                "app.scan_host",
-                side_effect=lambda host, arguments: host_results[host],
-            ):
-                app._run_scan("192.168.1.0/24", workers=2)
+        def fake_scan(target, arguments, **kwargs):
+            self.assertEqual(target, "192.168.1.0/24")
+            self.assertEqual(arguments, "-sV --open")
+            kwargs["on_progress"](34, "34% done")
+            kwargs["on_host"](host, [])
+            return "complete"
+
+        with patch("app.run_nmap_scan", side_effect=fake_scan) as scan:
+            app._run_scan(
+                "192.168.1.0/24", "-sV --open", "/usr/bin/nmap", False,
+            )
 
         events = []
         while not app.events.empty():
             events.append(app.events.get_nowait())
 
-        discover.assert_called_once_with("192.168.1.0/24", assume_up=False)
-        self.assertEqual(events[0], ("discovered", list(host_results)))
-        completed_hosts = {
-            payload[0]: payload[1]
-            for event, payload in events
-            if event == "host_results"
-        }
-        self.assertEqual(completed_hosts, host_results)
+        scan.assert_called_once()
+        self.assertEqual(events[0], ("nmap_progress", (34, "34% done")))
+        self.assertEqual(events[1], ("host_result", (host, [])))
         self.assertEqual(events[-1], ("finished", "complete"))
 
 

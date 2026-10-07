@@ -1,9 +1,12 @@
 import csv
+import queue
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from app import IPScannerApp
 from ip_scanner import (
     CSV_FIELDS,
     build_target,
@@ -88,6 +91,37 @@ class ScanOperationTests(unittest.TestCase):
         self.assertEqual(records[0]["hostname"], "host.local")
         self.assertEqual(records[0]["service"], "http")
         self.assertEqual(records[1]["version"], "1.24")
+
+
+class ProgressiveScanTests(unittest.TestCase):
+    def test_worker_publishes_discovery_and_each_host_result(self):
+        app = IPScannerApp.__new__(IPScannerApp)
+        app.events = queue.Queue()
+        app.cancel_event = threading.Event()
+        host_results = {
+            "192.168.1.2": [],
+            "192.168.1.3": [{"ip": "192.168.1.3", "port": 443}],
+        }
+
+        with patch(
+            "app.discover_hosts", return_value=list(host_results),
+        ) as discover:
+            with patch("app.scan_host", side_effect=host_results.get):
+                app._run_scan("192.168.1.0/24", workers=2)
+
+        events = []
+        while not app.events.empty():
+            events.append(app.events.get_nowait())
+
+        discover.assert_called_once_with("192.168.1.0/24")
+        self.assertEqual(events[0], ("discovered", list(host_results)))
+        completed_hosts = {
+            payload[0]: payload[1]
+            for event, payload in events
+            if event == "host_results"
+        }
+        self.assertEqual(completed_hosts, host_results)
+        self.assertEqual(events[-1], ("finished", "complete"))
 
 
 if __name__ == "__main__":

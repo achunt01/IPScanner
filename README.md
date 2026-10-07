@@ -10,7 +10,8 @@ Only scan networks and systems you own or are explicitly authorized to assess.
 - Discover responsive hosts, then identify open TCP services and versions with Nmap.
 - Set the number of concurrent host scans.
 - Cancel pending host scans while allowing active Nmap requests to finish.
-- View results in the desktop app and export them to CSV.
+- See every discovered host in the desktop app while its port scan is running,
+  including hosts with no open ports, and export open-port results to CSV.
 - Run the same scanning engine from the command line.
 
 ## Requirements

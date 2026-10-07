@@ -1,225 +1,63 @@
-import csv
-import ipaddress
-import socket
-import nmap
+"""Command-line interface for IP Scanner."""
 
-from tqdm import tqdm
+import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-MAX_THREADS = 20
-OUTPUT_FILE = "scan_results.csv"
+from tqdm import tqdm
 
-
-def resolve_hostname(ip):
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except Exception:
-        return ""
-
-
-def discover_hosts(target):
-    """
-    Ping sweep using Nmap.
-    Supports CIDR or single IP.
-    """
-    scanner = nmap.PortScanner()
-
-    print(f"\n[*] Discovering live hosts in {target}...")
-
-    scanner.scan(
-        hosts=target,
-        arguments="-sn"
-    )
-
-    hosts = scanner.all_hosts()
-
-    print(f"[*] Found {len(hosts)} live hosts\n")
-
-    return hosts
-
-
-def scan_host(ip):
-    """
-    Full port scan of discovered host.
-    """
-
-    scanner = nmap.PortScanner()
-
-    try:
-        scanner.scan(
-            hosts=ip,
-            arguments="-sV --open"
-        )
-
-        hostname = resolve_hostname(ip)
-
-        results = []
-
-        if ip not in scanner.all_hosts():
-            return []
-
-        for proto in scanner[ip].all_protocols():
-
-            ports = sorted(scanner[ip][proto].keys())
-
-            for port in ports:
-
-                service = scanner[ip][proto][port].get(
-                    "name",
-                    "unknown"
-                )
-
-                product = scanner[ip][proto][port].get(
-                    "product",
-                    ""
-                )
-
-                version = scanner[ip][proto][port].get(
-                    "version",
-                    ""
-                )
-
-                results.append({
-                    "ip": ip,
-                    "hostname": hostname,
-                    "protocol": proto,
-                    "port": port,
-                    "service": service,
-                    "product": product,
-                    "version": version
-                })
-
-        return results
-
-    except Exception as e:
-
-        return [{
-            "ip": ip,
-            "hostname": "",
-            "protocol": "",
-            "port": "",
-            "service": f"ERROR: {e}",
-            "product": "",
-            "version": ""
-        }]
-
-
-def save_csv(results):
-    fields = [
-        "ip",
-        "hostname",
-        "protocol",
-        "port",
-        "service",
-        "product",
-        "version"
-    ]
-
-    with open(
-        OUTPUT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8"
-    ) as f:
-
-        writer = csv.DictWriter(
-            f,
-            fieldnames=fields
-        )
-
-        writer.writeheader()
-
-        for row in results:
-            writer.writerow(row)
-
-    print(f"\n[+] Results exported to {OUTPUT_FILE}")
-
-
-def build_target():
-    print("Target Options")
-    print("--------------")
-    print("1. CIDR")
-    print("2. Start/End IP")
-
-    choice = input("\nSelect option: ").strip()
-
-    if choice == "1":
-
-        cidr = input(
-            "Enter CIDR (example: 192.168.1.0/24): "
-        ).strip()
-
-        ipaddress.ip_network(cidr)
-
-        return cidr
-
-    elif choice == "2":
-
-        start_ip = input("Start IP: ").strip()
-        end_ip = input("End IP: ").strip()
-
-        start = int(ipaddress.IPv4Address(start_ip))
-        end = int(ipaddress.IPv4Address(end_ip))
-
-        if start > end:
-            raise ValueError(
-                "Start IP must be lower than End IP"
-            )
-
-        return ",".join([
-            str(ipaddress.IPv4Address(ip))
-            for ip in range(start, end + 1)
-        ])
-
-    raise ValueError("Invalid selection")
+from ip_scanner import build_target, discover_hosts, export_results, scan_host
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Discover hosts and open services.")
+    parser.add_argument("--output", default="scan_results.csv", help="CSV output path")
+    parser.add_argument(
+        "--workers", type=int, default=20,
+        help="maximum concurrent host scans (default: 20)",
+    )
+    args = parser.parse_args()
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
 
-    target = build_target()
+    print("Target Options\n--------------\n1. CIDR\n2. Start/End IP")
+    choice = input("\nSelect option: ").strip()
+    try:
+        if choice == "1":
+            target = build_target(cidr=input("Enter CIDR: ").strip())
+        elif choice == "2":
+            target = build_target(
+                start_ip=input("Start IP: ").strip(),
+                end_ip=input("End IP: ").strip(),
+            )
+        else:
+            raise ValueError("Select 1 for CIDR or 2 for an IP range.")
 
-    live_hosts = discover_hosts(target)
+        print(f"\n[*] Discovering live hosts in {target}...")
+        hosts = discover_hosts(target)
+    except (ValueError, RuntimeError) as exc:
+        parser.exit(2, f"Error: {exc}\n")
 
-    if not live_hosts:
-        print("No live hosts found.")
+    print(f"[*] Found {len(hosts)} live host(s)")
+    if not hosts:
         return
 
-    print("[*] Starting port scans...\n")
+    results = []
+    print("[*] Starting service scans...")
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(scan_host, host): host for host in hosts}
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Scanning hosts"):
+            host = futures[future]
+            try:
+                results.extend(future.result())
+            except Exception as exc:
+                print(f"\n[!] Failed to scan {host}: {exc}")
 
-    scan_results = []
-
-    with ThreadPoolExecutor(
-        max_workers=MAX_THREADS
-    ) as executor:
-
-        futures = {
-            executor.submit(scan_host, ip): ip
-            for ip in live_hosts
-        }
-
-        with tqdm(
-            total=len(futures),
-            desc="Scanning Hosts"
-        ) as progress:
-
-            for future in as_completed(futures):
-
-                try:
-                    results = future.result()
-
-                    scan_results.extend(results)
-
-                except Exception as e:
-                    print(f"Error: {e}")
-
-                progress.update(1)
-
-    save_csv(scan_results)
-
-    print(
-        f"[+] Scan complete. "
-        f"{len(scan_results)} records exported."
-    )
+    try:
+        output = export_results(args.output, results)
+    except OSError as exc:
+        parser.exit(2, f"Could not write CSV: {exc}\n")
+    print(f"[+] Results exported to {output}")
+    print(f"[+] Scan complete. {len(results)} record(s) exported.")
 
 
 if __name__ == "__main__":

@@ -6,15 +6,21 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from ip_scanner import build_target, discover_hosts, export_results, scan_host
+from ip_scanner import (
+    build_scan_arguments,
+    build_target,
+    discover_hosts,
+    export_results,
+    scan_host,
+)
 
 
 class IPScannerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("IP Scanner")
-        self.root.geometry("1050x640")
-        self.root.minsize(760, 460)
+        self.root.geometry("1120x760")
+        self.root.minsize(900, 580)
 
         self.events = queue.Queue()
         self.cancel_event = threading.Event()
@@ -29,7 +35,17 @@ class IPScannerApp:
         self.start_ip = tk.StringVar()
         self.end_ip = tk.StringVar()
         self.workers = tk.IntVar(value=20)
+        self.tcp_scan = tk.StringVar(value="default")
+        self.scan_udp = tk.BooleanVar(value=False)
+        self.service_detection = tk.BooleanVar(value=True)
+        self.os_detection = tk.BooleanVar(value=False)
+        self.default_scripts = tk.BooleanVar(value=False)
+        self.timing = tk.StringVar(value="Default")
+        self.assume_up = tk.BooleanVar(value=False)
+        self.show_all_ports = tk.BooleanVar(value=False)
+        self.extra_arguments = tk.StringVar()
         self.status = tk.StringVar(value="Ready")
+        self.scan_option_widgets = []
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
@@ -88,6 +104,94 @@ class IPScannerApp:
         )
         self.export_button.pack(side=tk.LEFT)
 
+        options_frame = ttk.LabelFrame(container, text="Nmap scan options", padding=10)
+        options_frame.pack(fill=tk.X, pady=(10, 0))
+
+        ttk.Label(options_frame, text="TCP scan:").grid(row=0, column=0, sticky=tk.W)
+        self.tcp_scan_combo = ttk.Combobox(
+            options_frame,
+            textvariable=self.tcp_scan,
+            values=("Default", "SYN (-sS)", "Connect (-sT)", "Do not scan TCP"),
+            state="readonly",
+            width=19,
+        )
+        self.tcp_scan_combo.current(0)
+        self.tcp_scan_combo.grid(row=0, column=1, sticky=tk.W, padx=(5, 14))
+        self.udp_checkbox = ttk.Checkbutton(
+            options_frame, text="UDP scan (-sU)", variable=self.scan_udp,
+        )
+        self.udp_checkbox.grid(row=0, column=2, sticky=tk.W)
+        self.service_checkbox = ttk.Checkbutton(
+            options_frame, text="Service/version detection (-sV)",
+            variable=self.service_detection,
+        )
+        self.service_checkbox.grid(row=0, column=3, sticky=tk.W, padx=(8, 0))
+        self.os_checkbox = ttk.Checkbutton(
+            options_frame, text="OS detection (-O)", variable=self.os_detection,
+        )
+        self.os_checkbox.grid(row=0, column=4, sticky=tk.W, padx=(8, 0))
+        self.scripts_checkbox = ttk.Checkbutton(
+            options_frame, text="Default scripts (-sC)", variable=self.default_scripts,
+        )
+        self.scripts_checkbox.grid(row=0, column=5, sticky=tk.W, padx=(8, 0))
+
+        ttk.Label(options_frame, text="Ports (-p):").grid(
+            row=1, column=0, sticky=tk.W, pady=(8, 0),
+        )
+        self.ports_entry = ttk.Entry(options_frame, width=24)
+        self.ports_entry.grid(row=1, column=1, sticky=tk.W, padx=(5, 14), pady=(8, 0))
+        self.ports_entry.insert(0, "")
+        ttk.Label(options_frame, text="blank = Nmap default").grid(
+            row=1, column=2, sticky=tk.W, pady=(8, 0),
+        )
+        ttk.Label(options_frame, text="Timing (-T):").grid(
+            row=1, column=3, sticky=tk.E, padx=(8, 4), pady=(8, 0),
+        )
+        self.timing_combo = ttk.Combobox(
+            options_frame, textvariable=self.timing,
+            values=("Default", "0 - Paranoid", "1 - Sneaky", "2 - Polite",
+                    "3 - Normal", "4 - Aggressive", "5 - Insane"),
+            state="readonly", width=19,
+        )
+        self.timing_combo.current(0)
+        self.timing_combo.grid(row=1, column=4, sticky=tk.W, pady=(8, 0))
+
+        self.assume_up_checkbox = ttk.Checkbutton(
+            options_frame, text="Assume hosts are up (-Pn)",
+            variable=self.assume_up,
+        )
+        self.assume_up_checkbox.grid(
+            row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 0),
+        )
+        self.all_ports_checkbox = ttk.Checkbutton(
+            options_frame, text="Include closed/filtered ports",
+            variable=self.show_all_ports,
+        )
+        self.all_ports_checkbox.grid(
+            row=2, column=2, columnspan=3, sticky=tk.W, pady=(8, 0),
+        )
+
+        ttk.Label(options_frame, text="Additional Nmap arguments:").grid(
+            row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 0),
+        )
+        self.extra_arguments_entry = ttk.Entry(
+            options_frame, textvariable=self.extra_arguments,
+        )
+        self.extra_arguments_entry.grid(
+            row=3, column=2, columnspan=4, sticky=tk.EW, padx=(5, 0), pady=(8, 0),
+        )
+        ttk.Label(
+            options_frame,
+            text="Advanced options apply to port scans. Target and output options are managed by the app.",
+        ).grid(row=4, column=0, columnspan=6, sticky=tk.W, pady=(4, 0))
+        options_frame.columnconfigure(5, weight=1)
+        self.scan_option_widgets = [
+            self.tcp_scan_combo, self.udp_checkbox, self.service_checkbox,
+            self.os_checkbox, self.scripts_checkbox, self.ports_entry,
+            self.timing_combo, self.assume_up_checkbox, self.all_ports_checkbox,
+            self.extra_arguments_entry,
+        ]
+
         ttk.Label(
             container,
             text="Only scan networks and systems you own or are authorized to assess.",
@@ -97,14 +201,14 @@ class IPScannerApp:
         results_frame.pack(fill=tk.BOTH, expand=True)
         columns = (
             "ip", "hostname", "protocol", "port", "service", "product",
-            "version", "status",
+            "version", "state",
         )
         self.table = ttk.Treeview(
             results_frame, columns=columns, show="headings", selectmode="browse",
         )
         widths = {
             "ip": 110, "hostname": 125, "protocol": 70, "port": 60,
-            "service": 110, "product": 160, "version": 110, "status": 135,
+            "service": 110, "product": 160, "version": 110, "state": 90,
         }
         for column in columns:
             self.table.heading(column, text=column.capitalize())
@@ -143,6 +247,20 @@ class IPScannerApp:
             workers = int(self.workers.get())
             if not 1 <= workers <= 100:
                 raise ValueError("Concurrent hosts must be between 1 and 100.")
+            scan_types = ("default", "syn", "connect", "none")
+            scan_type = scan_types[self.tcp_scan_combo.current()]
+            scan_arguments = build_scan_arguments(
+                tcp_scan=scan_type,
+                scan_udp=self.scan_udp.get(),
+                ports=self.ports_entry.get(),
+                service_detection=self.service_detection.get(),
+                os_detection=self.os_detection.get(),
+                default_scripts=self.default_scripts.get(),
+                timing=("default" if self.timing_combo.current() == 0
+                        else str(self.timing_combo.current() - 1)),
+                show_all_ports=self.show_all_ports.get(),
+                extra_arguments=self.extra_arguments.get(),
+            )
         except (ValueError, tk.TclError) as exc:
             messagebox.showerror("Invalid scan settings", str(exc), parent=self.root)
             return
@@ -158,18 +276,23 @@ class IPScannerApp:
         self.start_button.configure(state=tk.DISABLED)
         self.cancel_button.configure(state=tk.NORMAL)
         self.export_button.configure(state=tk.DISABLED)
-        for widget in (self.cidr_entry, self.start_entry, self.end_entry, self.workers_spinbox):
+        for widget in (
+            self.cidr_entry, self.start_entry, self.end_entry,
+            self.workers_spinbox, *self.scan_option_widgets,
+        ):
             widget.configure(state=tk.DISABLED)
         self.cidr_radio.configure(state=tk.DISABLED)
         self.range_radio.configure(state=tk.DISABLED)
 
         threading.Thread(
-            target=self._run_scan, args=(target, workers), daemon=True,
+            target=self._run_scan,
+            args=(target, workers, scan_arguments, self.assume_up.get()),
+            daemon=True,
         ).start()
 
-    def _run_scan(self, target, workers):
+    def _run_scan(self, target, workers, scan_arguments="-sV --open", assume_up=False):
         try:
-            hosts = discover_hosts(target)
+            hosts = discover_hosts(target, assume_up=assume_up)
             self.events.put(("discovered", hosts))
             if self.cancel_event.is_set() or not hosts:
                 self.events.put(("finished", "cancelled" if self.cancel_event.is_set() else "empty"))
@@ -180,7 +303,7 @@ class IPScannerApp:
             def scan_if_active(host):
                 if self.cancel_event.is_set():
                     return None
-                return scan_host(host)
+                return scan_host(host, arguments=scan_arguments)
 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = {
@@ -240,8 +363,8 @@ class IPScannerApp:
                             "", tk.END,
                             values=tuple(result.get(key, "") for key in (
                                 "ip", "hostname", "protocol", "port",
-                                "service", "product", "version",
-                            )) + ("Open",),
+                                "service", "product", "version", "state",
+                            )),
                         )
                     if not results:
                         self.table.insert(
@@ -291,6 +414,8 @@ class IPScannerApp:
         self.range_radio.configure(state=tk.NORMAL)
         self._update_target_fields()
         self.workers_spinbox.configure(state=tk.NORMAL)
+        for widget in self.scan_option_widgets:
+            widget.configure(state="readonly" if isinstance(widget, ttk.Combobox) else tk.NORMAL)
         self.status.set({
             "complete": f"Complete — {len(self.results)} open port(s) found",
             "cancelled": f"Cancelled — {len(self.results)} record(s) collected",

@@ -1,5 +1,6 @@
 import csv
 import queue
+import shlex
 import tempfile
 import threading
 import unittest
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, patch
 from app import IPScannerApp
 from ip_scanner import (
     CSV_FIELDS,
+    build_scan_arguments,
     build_target,
     discover_hosts,
     export_results,
@@ -35,6 +37,53 @@ class BuildTargetTests(unittest.TestCase):
             build_target(start_ip="10.0.0.1")
 
 
+class BuildScanArgumentsTests(unittest.TestCase):
+    def test_default_options_preserve_current_scan(self):
+        self.assertEqual(
+            build_scan_arguments(),
+            "-sV --open",
+        )
+
+    def test_combines_common_options_and_advanced_values(self):
+        arguments = build_scan_arguments(
+            tcp_scan="connect",
+            scan_udp=True,
+            ports="22,80,443",
+            service_detection=False,
+            os_detection=True,
+            default_scripts=True,
+            timing="4",
+            show_all_ports=True,
+            extra_arguments='--script-args user="scan value"',
+        )
+        self.assertEqual(shlex.split(arguments), [
+            "-sT", "-sU", "-p", "22,80,443", "-O", "-sC", "-T4",
+            "--script-args", "user=scan value",
+        ])
+
+    def test_rejects_missing_scan_mode(self):
+        with self.assertRaisesRegex(ValueError, "Select a TCP scan"):
+            build_scan_arguments(tcp_scan="none")
+
+    def test_rejects_extra_target(self):
+        with self.assertRaisesRegex(ValueError, "cannot add targets"):
+            build_scan_arguments(extra_arguments="192.168.1.20")
+
+    def test_rejects_managed_output_options(self):
+        with self.assertRaisesRegex(ValueError, "managed"):
+            build_scan_arguments(extra_arguments="-oN results.txt")
+
+    def test_rejects_unclosed_advanced_argument_quote(self):
+        with self.assertRaisesRegex(ValueError, "Invalid advanced"):
+            build_scan_arguments(extra_arguments='"unterminated')
+
+    def test_advanced_option_can_take_a_dash_prefixed_value(self):
+        arguments = build_scan_arguments(
+            extra_arguments="--script-args=-user=scan",
+        )
+        self.assertIn("--script-args=-user=scan", shlex.split(arguments))
+
+
 class ExportResultsTests(unittest.TestCase):
     def test_writes_header_and_rows(self):
         record = {
@@ -42,6 +91,7 @@ class ExportResultsTests(unittest.TestCase):
             "hostname": "host",
             "protocol": "tcp",
             "port": 443,
+            "state": "open",
             "service": "https",
             "product": "nginx",
             "version": "1.24",
@@ -56,6 +106,7 @@ class ExportResultsTests(unittest.TestCase):
         self.assertEqual(tuple(rows[0]), CSV_FIELDS)
         self.assertEqual(rows[0]["ip"], record["ip"])
         self.assertEqual(rows[0]["port"], "443")
+        self.assertEqual(rows[0]["state"], "open")
 
 
 class ScanOperationTests(unittest.TestCase):
@@ -70,11 +121,25 @@ class ScanOperationTests(unittest.TestCase):
         )
         self.assertEqual(hosts, ["192.168.1.5"])
 
+    def test_discovery_can_assume_hosts_are_up(self):
+        scanner = MagicMock()
+        scanner.all_hosts.return_value = ["192.168.1.5", "192.168.1.6"]
+        with patch("ip_scanner._port_scanner", return_value=scanner):
+            hosts = discover_hosts("192.168.1.0/24", assume_up=True)
+
+        scanner.scan.assert_called_once_with(
+            hosts="192.168.1.0/24", arguments="-sn -Pn",
+        )
+        self.assertEqual(len(hosts), 2)
+
     def test_scan_host_extracts_sorted_service_records(self):
         host_data = MagicMock()
         host_data.all_protocols.return_value = ["tcp"]
         host_data.__getitem__.return_value = {
-            443: {"name": "https", "product": "nginx", "version": "1.24"},
+            443: {
+                "name": "https", "product": "nginx", "version": "1.24",
+                "state": "open",
+            },
             80: {"name": "http"},
         }
         scanner = MagicMock()
@@ -91,6 +156,20 @@ class ScanOperationTests(unittest.TestCase):
         self.assertEqual(records[0]["hostname"], "host.local")
         self.assertEqual(records[0]["service"], "http")
         self.assertEqual(records[1]["version"], "1.24")
+        self.assertEqual(records[1]["state"], "open")
+
+    def test_scan_host_uses_custom_arguments(self):
+        host_data = MagicMock()
+        host_data.all_protocols.return_value = []
+        scanner = MagicMock()
+        scanner.all_hosts.return_value = ["192.168.1.5"]
+        scanner.__getitem__.return_value = host_data
+        with patch("ip_scanner._port_scanner", return_value=scanner):
+            scan_host("192.168.1.5", arguments="-sT -p 22")
+
+        scanner.scan.assert_called_once_with(
+            hosts="192.168.1.5", arguments="-sT -p 22",
+        )
 
 
 class ProgressiveScanTests(unittest.TestCase):
@@ -103,17 +182,18 @@ class ProgressiveScanTests(unittest.TestCase):
             "192.168.1.3": [{"ip": "192.168.1.3", "port": 443}],
         }
 
-        with patch(
-            "app.discover_hosts", return_value=list(host_results),
-        ) as discover:
-            with patch("app.scan_host", side_effect=host_results.get):
+        with patch("app.discover_hosts", return_value=list(host_results)) as discover:
+            with patch(
+                "app.scan_host",
+                side_effect=lambda host, arguments: host_results[host],
+            ):
                 app._run_scan("192.168.1.0/24", workers=2)
 
         events = []
         while not app.events.empty():
             events.append(app.events.get_nowait())
 
-        discover.assert_called_once_with("192.168.1.0/24")
+        discover.assert_called_once_with("192.168.1.0/24", assume_up=False)
         self.assertEqual(events[0], ("discovered", list(host_results)))
         completed_hosts = {
             payload[0]: payload[1]

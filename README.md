@@ -7,7 +7,11 @@ Only scan networks and systems you own or are explicitly authorized to assess.
 ## Features
 
 - Scan a CIDR network or an inclusive IPv4 start/end range.
-- Discover responsive hosts, then identify open TCP services and versions with Nmap.
+- Configure TCP SYN/connect scans, UDP scans, ports, service/version detection,
+  OS detection, default scripts, and Nmap timing templates.
+- Enter additional Nmap arguments for options not exposed as individual controls.
+- Choose whether to assume target hosts are up and whether to include
+  non-open port states.
 - Set the number of concurrent host scans.
 - Cancel pending host scans while allowing active Nmap requests to finish.
 - See every discovered host in the desktop app while its port scan is running,
@@ -48,6 +52,15 @@ The CLI prompts for a CIDR or start/end IP range. Use `--workers` to change conc
 python EnhancedIPScanner.py --workers 10 --output results.csv
 ```
 
+The desktop app's **Additional Nmap arguments** field applies extra options to
+port scans. IP Scanner controls target selection and output handling, so Nmap
+target-list and output-file options are not accepted there. The **Default
+scripts (-sC)** option runs Nmap's default NSE scripts; scan only systems you
+are authorized to assess. TCP SYN and OS detection may require administrator
+or root privileges; use TCP Connect when elevated privileges are unavailable.
+For advanced options with values, use shell-style quoting (for example,
+`--script-args 'user=scan value'`).
+
 `IPScanner.py` is retained as a compatibility entry point for the desktop app.
 
 ## Build desktop packages
@@ -65,7 +78,10 @@ The resulting application still requires Nmap to be installed separately. Builds
 
 ## CSV fields
 
-Exports include `ip`, `hostname`, `protocol`, `port`, `service`, `product`, and `version`. A CSV is created by the desktop app when you choose **Export CSV…**; the CLI writes to `scan_results.csv` unless another path is passed with `--output`.
+Exports include `ip`, `hostname`, `protocol`, `port`, `state`, `service`,
+`product`, and `version`. A CSV is created by the desktop app when you choose
+**Export CSV…**; the CLI writes to `scan_results.csv` unless another path is
+passed with `--output`.
 
 ## License
 
